@@ -139,3 +139,39 @@ func TestConcurrentBarrier(t *testing.T) {
 		t.Fatal("Acquire after drain must keep failing")
 	}
 }
+
+// TestInFlightTracksLeases pins the lease counter used by the drain
+// acceptance: granted leases are visible while held, hit zero after every
+// release, and stay at zero once the barrier has fallen.
+func TestInFlightTracksLeases(t *testing.T) {
+	g := NewGate()
+	if got := g.InFlight(); got != 0 {
+		t.Fatalf("fresh gate InFlight=%d, want 0", got)
+	}
+	r1, _ := g.Acquire()
+	r2, _ := g.Acquire()
+	if got := g.InFlight(); got != 2 {
+		t.Fatalf("InFlight=%d with two leases, want 2", got)
+	}
+	r1()
+	if got := g.InFlight(); got != 1 {
+		t.Fatalf("InFlight=%d after one release, want 1", got)
+	}
+	g.BeginDrain()
+	r2()
+	if got := g.InFlight(); got != 0 {
+		t.Fatalf("InFlight=%d after draining to zero, want 0", got)
+	}
+	select {
+	case <-g.Drained():
+	case <-time.After(time.Second):
+		t.Fatal("zero leases while draining must close Drained")
+	}
+	// Refused grants after the barrier never move the counter.
+	if _, ok := g.Acquire(); ok {
+		t.Fatal("lease granted after drain")
+	}
+	if got := g.InFlight(); got != 0 {
+		t.Fatalf("InFlight=%d after refused grants, want 0", got)
+	}
+}

@@ -18,10 +18,21 @@
 // reports no new arrivals and the same snapshot; going backwards, past the
 // deadline, or advancing a terminal event is rejected and never mutates the
 // event.
+//
+// Request cancellation, domain commit and response delivery are separate
+// boundaries. The shortest-path build observes the request context, so an
+// event whose creator went away never finishes its computation or enters
+// the store: a store commit only happens after the create response has been
+// delivered. For advances the commit is atomic and permanent; when the
+// response describing a non-empty increment cannot be delivered, the
+// increment is recorded as undelivered and the next same-minute request
+// replays that exact increment and snapshot, so a retried advance can never
+// lose a committed arrival.
 package incident
 
 import (
 	"container/heap"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -209,15 +220,20 @@ func (p *pq) Pop() any {
 // not inserted (they can never move contamination anywhere) and there are no
 // reverse arcs, so neither can produce propagation. It returns the earliest
 // arrival minute per node (math.MaxInt64 when unreachable) and the minute of
-// the first release.
-func earliestArrivals(s Spec) ([]int64, int64) {
+// the first release. The relaxation observes ctx, so a cancelled create
+// request stops the build rather than running the whole graph for nobody.
+func earliestArrivals(ctx context.Context, s Spec) ([]int64, int64, error) {
 	inf := int64(math.MaxInt64)
 	dist := make([]int64, s.N)
 	for i := range dist {
 		dist[i] = inf
 	}
 	adj := make([][]adjEdge, s.N)
-	for _, p := range s.Pipes {
+	for i := range s.Pipes {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		p := s.Pipes[i]
 		if p.From == p.To {
 			continue // a self-loop can never carry contamination to a new node
 		}
@@ -239,7 +255,14 @@ func earliestArrivals(s Spec) ([]int64, int64) {
 		}
 	}
 	heap.Init(&queue)
+	popped := 0
 	for queue.Len() > 0 {
+		if popped&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
+		popped++
 		cur := heap.Pop(&queue).(pqItem)
 		if cur.d != dist[cur.v] {
 			continue // stale queue entry after a better relaxation
@@ -252,7 +275,17 @@ func earliestArrivals(s Spec) ([]int64, int64) {
 			}
 		}
 	}
-	return dist, first
+	return dist, first, nil
+}
+
+// undeliveredAdvance preserves the exact outcome of a committed advance
+// whose response never reached the caller. It is replayed once to the next
+// same-minute request so a retried advance cannot silently lose the
+// increment, then discarded when that replay is delivered.
+type undeliveredAdvance struct {
+	minute      int64
+	newArrivals []Arrival
+	snapshot    Snapshot
 }
 
 // Incident is a stored event. Its methods are safe for concurrent use: every
@@ -267,19 +300,30 @@ type Incident struct {
 	intakes  []int // de-duplicated intake nodes
 	first    int64 // minute of the first release
 
-	mu      sync.Mutex
-	started bool   // false until the first successful advance
-	current int64  // committed clock minute (0 before start)
-	status  Status // committed status
+	mu          sync.Mutex
+	started     bool   // false until the first successful advance
+	current     int64  // committed clock minute (0 before start)
+	status      Status // committed status
+	undelivered *undeliveredAdvance
 }
 
 // NewIncident validates the spec, pre-computes all earliest arrivals and
 // returns the event in its initial scheduled state.
 func NewIncident(spec Spec) (*Incident, error) {
+	return NewIncidentCtx(context.Background(), spec)
+}
+
+// NewIncidentCtx is the cancellation-aware form of NewIncident: the
+// shortest-path build aborts when ctx is cancelled, in which case no event
+// exists and the caller must not store anything.
+func NewIncidentCtx(ctx context.Context, spec Spec) (*Incident, error) {
 	if err := Validate(spec); err != nil {
 		return nil, err
 	}
-	dist, first := earliestArrivals(spec)
+	dist, first, err := earliestArrivals(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
 	isIntake := make([]bool, spec.N)
 	intakes := make([]int, 0, len(spec.Intakes))
 	for _, id := range spec.Intakes {
@@ -343,15 +387,23 @@ func (in *Incident) statusAt(t int64) Status {
 // Advance validates the target minute and, if legal, atomically commits the
 // new clock, the arrivals newly revealed by this tick and the resulting
 // status. It returns the newly arrived nodes (sorted by minute then node),
-// the fresh snapshot, and nil. A same-minute retry returns an empty increment
-// and the identical snapshot. Every rejection leaves the event untouched.
+// the fresh snapshot, and nil. A same-minute request returns an empty
+// increment and the identical snapshot — except when a previous same-minute
+// commit's response was never delivered, in which case that exact increment
+// and snapshot are replayed. Every rejection leaves the event untouched.
 func (in *Incident) Advance(target int64) ([]Arrival, Snapshot, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 
-	// Idempotent retry: the committed minute is reported again with no
-	// increment and an identical snapshot, even after termination.
+	// Idempotent retry at the committed minute. If the outcome of the first
+	// commit at this minute was never delivered, replay it verbatim so the
+	// caller can confirm the committed increment; otherwise a retry reports
+	// no increment and an identical snapshot, even after termination.
 	if in.started && target == in.current {
+		if u := in.undelivered; u != nil && u.minute == target {
+			out := append([]Arrival(nil), u.newArrivals...)
+			return out, u.snapshot, nil
+		}
 		return []Arrival{}, in.snapshotLocked(), nil
 	}
 	if (in.started && target < in.current) || (!in.started && target < 0) {
@@ -392,6 +444,36 @@ func (in *Incident) Advance(target int64) ([]Arrival, Snapshot, error) {
 	return newArrivals, in.snapshotLocked(), nil
 }
 
+// MarkUndelivered records that the response of the most recent committed
+// advance to minute — carrying newArrivals and snap — was not successfully
+// delivered. The next same-minute Advance replays it. It is a no-op when the
+// recorded minute is no longer the committed clock (a later commit already
+// superseded this outcome).
+func (in *Incident) MarkUndelivered(minute int64, newArrivals []Arrival, snap Snapshot) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if !in.started || in.current != minute {
+		return
+	}
+	in.undelivered = &undeliveredAdvance{
+		minute:      minute,
+		newArrivals: append([]Arrival(nil), newArrivals...),
+		snapshot:    snap,
+	}
+}
+
+// AcknowledgeAdvance drops the undelivered marker for minute once a
+// same-minute response has been delivered. It is safe to call after empty
+// retries and conflict responses as well: a marker for a different minute is
+// left untouched for its own retry.
+func (in *Incident) AcknowledgeAdvance(minute int64) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if in.undelivered != nil && in.undelivered.minute == minute {
+		in.undelivered = nil
+	}
+}
+
 // Store is the in-memory collection of incidents. The map lock only guards
 // map membership; per-incident ordering is handled by the Incident lock.
 type Store struct {
@@ -405,7 +487,10 @@ func NewStore() *Store {
 }
 
 // Create validates the spec, computes propagation and stores a new incident
-// with a random identifier.
+// with a random identifier. It is kept for callers that do not need to
+// separate domain preparation from the store commit; HTTP create flows use
+// Prepare + Commit so that nothing enters the store before the response
+// carrying the new identifier has been delivered.
 func (s *Store) Create(spec Spec) (*Incident, error) {
 	in, err := NewIncident(spec)
 	if err != nil {
@@ -416,10 +501,43 @@ func (s *Store) Create(spec Spec) (*Incident, error) {
 		return nil, err
 	}
 	in.id = id
-	s.mu.Lock()
-	s.byID[id] = in
-	s.mu.Unlock()
+	return s.Commit(in), nil
+}
+
+// Prepare validates the spec, runs the context-aware propagation build and
+// assigns a random identifier, without inserting the event into the store.
+// Callers deliver the create response and only then Commit the prepared
+// event; a request cancelled during the build or a response that fails to
+// write therefore never leaves an orphan the caller cannot name.
+func (s *Store) Prepare(ctx context.Context, spec Spec) (*Incident, error) {
+	in, err := NewIncidentCtx(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	id, err := newID()
+	if err != nil {
+		return nil, err
+	}
+	in.id = id
 	return in, nil
+}
+
+// Commit inserts a prepared incident into the store and returns it. It is
+// called only after the create response has been delivered.
+func (s *Store) Commit(in *Incident) *Incident {
+	s.mu.Lock()
+	s.byID[in.id] = in
+	s.mu.Unlock()
+	return in
+}
+
+// Len reports how many incidents the store currently holds. It lets the
+// cancellation/delivery tests assert that uncommitted or undelivered creates
+// leave no orphan behind.
+func (s *Store) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.byID)
 }
 
 // Get returns the incident with the given id.

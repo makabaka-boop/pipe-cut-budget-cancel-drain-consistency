@@ -2,9 +2,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"strconv"
 
 	"raincut/internal/flow"
 	"raincut/internal/incident"
@@ -67,8 +71,15 @@ func NewMux() http.Handler {
 // gate. Business routes (/mincut, /incidents, /incidents/{id}/advance) are
 // wrapped by the barrier; the /healthz and /readyz probes bypass it.
 func NewMuxWithGate(g *lifecycle.Gate) http.Handler {
+	return newMux(g, incident.NewStore())
+}
+
+// newMux wires the routes of a server built around the shared gate and
+// store. Tests supply their own store so they can count committed events
+// across cancelled and failed requests.
+func newMux(g *lifecycle.Gate, store *incident.Store) http.Handler {
 	mux := http.NewServeMux()
-	s := &server{incidents: incident.NewStore(), gate: g}
+	s := &server{incidents: store, gate: g}
 	mux.HandleFunc("/mincut", s.admit(handleMinCut))
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -80,7 +91,10 @@ func NewMuxWithGate(g *lifecycle.Gate) http.Handler {
 // admit enforces the drain barrier on a business route. While the gate is
 // accepting the request takes a lease and runs to completion — even if its
 // body is still arriving when the barrier falls. Once draining, the request
-// never enters the handler, mutates no state, and gets a stable 503.
+// never enters the handler, mutates no state, and gets a stable 503. The
+// lease is released when the handler returns, which for a request whose
+// caller went away happens as soon as the cancellation-aware handler
+// unwinds, so an abandoned computation cannot hold the drain open.
 func (s *server) admit(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		release, ok := s.gate.Acquire()
@@ -114,18 +128,8 @@ func handleMinCut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	var req SolveRequest
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_json",
-			"body must be a single JSON object with integer fields: "+err.Error())
-		return
-	}
-	if dec.More() {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_json",
-			"body must contain exactly one JSON value")
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	edges, sources, sinks, msg := validate(&req)
@@ -133,7 +137,17 @@ func handleMinCut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_input", msg)
 		return
 	}
-	cost := flow.MinShutdownCost(int(req.N), edges, sources, sinks)
+	// The solver observes the request context: if the caller abandons the
+	// page while a large cut is still running, the computation unwinds and
+	// releases the drain lease immediately instead of running to completion.
+	cost, err := flow.MinShutdownCostCtx(r.Context(), int(req.N), edges, sources, sinks)
+	if err != nil {
+		if clientGone(r, err) {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "minimum cut failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, SolveResponse{MinimumShutdownCost: cost})
 }
 
@@ -187,12 +201,56 @@ func validate(req *SolveRequest) ([]flow.Edge, []int, []int, string) {
 	return edges, sources, sinks, ""
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// writeJSON serialises v and delivers status plus the complete body in one
+// write. Encoding happens before any byte reaches the client, so an encoding
+// failure can still produce a stable 500 instead of a truncated 200 response.
+// Failures of the actual connection write are returned to the caller, which
+// must treat the operation result as undelivered (the domain layer keeps
+// committed advances recoverable; creates are only committed afterwards).
+func writeJSON(w http.ResponseWriter, status int, v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("api: encode response: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, werr := w.Write([]byte(`{"error":{"code":"internal_error","message":"could not encode response"}}`))
+		return werr
+	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if _, err := w.Write(body); err != nil {
+		return err
+	}
+	// Force the bytes onto the wire now. Without this, small bodies can sit
+	// in the server's write buffer until the handler returns, which would
+	// surface a broken connection only after the caller could act on the
+	// failure.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
 }
 
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, ErrorResponse{Error: ErrorDetail{Code: code, Message: message}})
+// writeError delivers the stable error structure and reports whether the
+// error body actually reached the client. Callers that just wrote a response
+// of their own need this signal to decide whether a committed result must be
+// remembered as undelivered.
+func writeError(w http.ResponseWriter, status int, code, message string) error {
+	return writeJSON(w, status, ErrorResponse{Error: ErrorDetail{Code: code, Message: message}})
+}
+
+// clientGone reports whether err is the request giving up: its context was
+// cancelled or hit its deadline (client closed the page / connection), or
+// the body read/write itself failed because of that cancellation. Such a
+// failure carries no deliverable response and must not change the stable
+// error contract for any other failure.
+func clientGone(r *http.Request, err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if cerr := r.Context().Err(); cerr != nil {
+		return true
+	}
+	return false
 }

@@ -108,6 +108,16 @@ func (g *Gate) State() State {
 	return g.state
 }
 
+// InFlight reports how many business-request leases are currently held. The
+// drain acceptance uses it to assert that abandoned requests (cancelled
+// clients, failed response writes) have actually released their leases
+// instead of holding the drain past DRAIN_TIMEOUT.
+func (g *Gate) InFlight() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.inflight
+}
+
 // Drained returns a channel that is closed once the gate is draining and the
 // last outstanding lease has been released.
 func (g *Gate) Drained() <-chan struct{} {

@@ -480,6 +480,96 @@ func verifyDrainTimeout() {
 		func(code int) bool { return code != 0 }, "non-zero")
 }
 
+// drainLargeMincutPayload is a valid large /mincut body. Its topology parse
+// and Dinic phases are cancellation-aware, so an in-flight request on this
+// payload unwinds as soon as the client connection disappears.
+func drainLargeMincutPayload() []byte {
+	const n = 20000
+	const m = 100000
+	type edge struct {
+		From int64 `json:"from"`
+		To   int64 `json:"to"`
+		Cost int64 `json:"cost"`
+	}
+	state := uint64(20260916)
+	next := func() uint64 {
+		state = state*6364136223846793005 + 1442695040888963407
+		return state >> 11
+	}
+	edges := make([]edge, 0, m)
+	for i := int64(2); i <= 5000; i++ {
+		edges = append(edges, edge{0, i, 1_000_000_000})
+		edges = append(edges, edge{i, 1, int64(next()%1000) + 1})
+	}
+	for len(edges) < m {
+		u := int64(2 + next()%uint64(n-2))
+		v := int64(2 + next()%uint64(n-2))
+		edges = append(edges, edge{u, v, 1_000_000_000})
+	}
+	raw, err := json.Marshal(struct {
+		N       int64   `json:"n"`
+		Edges   []edge  `json:"edges"`
+		Sources []int64 `json:"sources"`
+		Sinks   []int64 `json:"sinks"`
+	}{N: n, Edges: edges, Sources: []int64{0}, Sinks: []int64{1}})
+	if err != nil {
+		fail("drain: cancelled-request payload", "marshal: %v", err)
+		return nil
+	}
+	return raw
+}
+
+// verifyDrainCancelledRequest reproduces the abandoned-computation path:
+// the client sends a full, large business request and immediately closes the
+// connection (operator closed the page), then SIGTERM arrives. The request's
+// parse/solve must observe the cancellation, release its lease and stop
+// holding the drain open: the process exits 0 within DRAIN_TIMEOUT instead
+// of being force-closed with a non-zero status after the timeout.
+func verifyDrainCancelledRequest() {
+	payload := drainLargeMincutPayload()
+	if payload == nil {
+		return
+	}
+	// A 1s timeout keeps the assertion tight: a computation that ignores
+	// cancellation (parse alone takes longer than that on this payload)
+	// cannot drain in time and the process exits non-zero, failing the
+	// check; a cancellation-aware handler releases its lease immediately.
+	p := startAPIProcess("drain: cancelled child start", "1s")
+	if p == nil {
+		return
+	}
+	conn, err := net.DialTimeout("tcp", p.addr, 5*time.Second)
+	if err != nil {
+		fail("drain: cancelled request", "dial: %v", err)
+		p.cmd.Process.Kill()
+		return
+	}
+	head := fmt.Sprintf("POST /mincut HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		p.addr, len(payload))
+	if _, err := conn.Write([]byte(head)); err != nil {
+		fail("drain: cancelled request", "write headers: %v", err)
+		conn.Close()
+		p.cmd.Process.Kill()
+		return
+	}
+	// Send the whole body (loopback is buffered fast), then abandon the
+	// connection without reading the response.
+	if _, err := conn.Write(payload); err != nil {
+		fail("drain: cancelled request", "write body: %v", err)
+		conn.Close()
+		p.cmd.Process.Kill()
+		return
+	}
+	_ = conn.Close()
+
+	// Barrier falls right after the abandoned request took its lease.
+	p.signal("drain: cancelled request SIGTERM", syscall.SIGTERM)
+	// The abandoned compute must release its lease promptly; with the 1s
+	// drain timeout a clean exit proves leases hit zero before the deadline.
+	p.expectExit("drain: abandoned compute releases its lease and exits 0", 8*time.Second,
+		func(code int) bool { return code == 0 }, "0")
+}
+
 // verifyDrain runs the graceful-drain acceptance suite against real child
 // processes.
 func verifyDrain() {
@@ -490,5 +580,6 @@ func verifyDrain() {
 	pass("drain: api binary available")
 	verifyDrainIdle()
 	verifyDrainNormal()
+	verifyDrainCancelledRequest()
 	verifyDrainTimeout()
 }

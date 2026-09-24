@@ -1,12 +1,14 @@
 package incident
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 )
 
 func mustIncident(t *testing.T, spec Spec) *Incident {
@@ -552,4 +554,186 @@ func ExampleIncident() {
 	_, snap, _ := in.Advance(10)
 	fmt.Println(snap.Status)
 	// Output: breached
+}
+
+// largePipes builds the maximum-size topology used by the cancellation
+// tests; the Dijkstra build takes milliseconds, long enough to race a
+// cancellation reliably.
+func largePipes() Spec {
+	const n = MaxNodes
+	const m = MaxPipes
+	state := uint64(20260917)
+	next := func() uint64 {
+		state = state*6364136223846793005 + 1442695040888963407
+		return state >> 11
+	}
+	pipes := make([]Pipe, 0, m)
+	for len(pipes) < m {
+		u := int(next() % n)
+		v := int(next() % n)
+		pipes = append(pipes, Pipe{u, v, int64(1 + next()%1000)})
+	}
+	return Spec{N: n, Pipes: pipes, Releases: []Release{{0, 0}}, Intakes: []int{n - 1}, Deadline: MaxMinutes}
+}
+
+func TestNewIncidentCtxPreCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := NewIncidentCtx(ctx, largePipes()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-cancelled build err=%v, want context.Canceled", err)
+	}
+}
+
+func TestNewIncidentCtxCancelledMidBuild(t *testing.T) {
+	const races = 10
+	observed := false
+	for i := 0; i < races; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := NewIncidentCtx(ctx, largePipes())
+			done <- err
+		}()
+		time.AfterFunc(time.Duration(i)*100*time.Microsecond, cancel)
+		select {
+		case err := <-done:
+			if errors.Is(err, context.Canceled) {
+				observed = true
+			} else if err != nil {
+				t.Fatalf("build err=%v, want nil or context.Canceled", err)
+			}
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("cancelled build never returned")
+		}
+	}
+	if !observed {
+		t.Fatalf("none of %d races observed a mid-build cancellation", races)
+	}
+}
+
+// chainSpec is 0 -1-> 1 -1-> 2 (intake), release 0@0, deadline 10.
+func chainSpec() Spec {
+	return Spec{
+		N:        3,
+		Pipes:    []Pipe{{0, 1, 1}, {1, 2, 1}},
+		Releases: []Release{{0, 0}},
+		Intakes:  []int{2},
+		Deadline: 10,
+	}
+}
+
+// TestAdvanceReplaysUndeliveredIncrement pins the delivery boundary: once a
+// committed non-empty increment is marked undelivered, the next same-minute
+// request replays the exact arrivals and snapshot; a further same-minute
+// request then behaves as the normal idempotent empty retry, and unrelated
+// minutes/conflicts stay unchanged.
+func TestAdvanceReplaysUndeliveredIncrement(t *testing.T) {
+	in := mustIncident(t, chainSpec())
+
+	ar, snap, err := in.Advance(5) // commits arrivals 0@0, 1@1, 2@2 -> breached
+	if err != nil || snap.Status != Breached || len(ar) != 3 {
+		t.Fatalf("advance: ar=%v snap=%+v err=%v", ar, snap, err)
+	}
+	// Response delivery failed: remember the increment.
+	in.MarkUndelivered(5, ar, snap)
+
+	// Same-minute retry replays the exact increment with the identical
+	// snapshot instead of the usual empty list.
+	re, rsnap, err := in.Advance(5)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(re) != 3 {
+		t.Fatalf("replayed arrivals=%v, want the original 3 arrivals", re)
+	}
+	for i := range re {
+		if re[i] != ar[i] {
+			t.Fatalf("replayed arrival %d = %v, want %v", i, re[i], ar[i])
+		}
+	}
+	if rsnap.CurrentMinute != 5 || rsnap.Status != Breached || len(rsnap.EarliestArrivals) != 3 {
+		t.Fatalf("replayed snapshot=%+v, want minute 5 breached with 3 arrivals", rsnap)
+	}
+	// Acknowledge delivery: the marker is gone, subsequent same-minute
+	// requests are ordinary empty idempotent retries.
+	in.AcknowledgeAdvance(5)
+	re2, _, err := in.Advance(5)
+	if err != nil || len(re2) != 0 {
+		t.Fatalf("post-ack retry=%v err=%v, want empty", re2, err)
+	}
+	// Marker replay does not move the clock: backwards is still a conflict.
+	if _, _, err := in.Advance(4); !errors.Is(err, ErrClockRegression) {
+		t.Fatalf("backwards after replay err=%v, want clock_regression", err)
+	}
+}
+
+// TestUndeliveredMarkerSupersededByLaterCommit shows a stale marker for an
+// older minute never leaks: after a later commit the old marker is ignored
+// and eventually harmless.
+func TestUndeliveredMarkerSupersededByLaterCommit(t *testing.T) {
+	spec := Spec{
+		N:        4,
+		Pipes:    []Pipe{{0, 1, 1}, {1, 2, 1}, {2, 3, 1}},
+		Releases: []Release{{0, 0}},
+		Intakes:  []int{3},
+		Deadline: 10,
+	}
+	in := mustIncident(t, spec)
+	ar1, snap1, _ := in.Advance(2)
+	in.MarkUndelivered(2, ar1, snap1)
+	// A later commit wins the clock (intake node 3 only arrives at 3, so the
+	// event is still non-terminal at 2).
+	ar2, snap2, err := in.Advance(3)
+	if err != nil || snap2.Status != Breached || len(ar2) != 1 {
+		t.Fatalf("later commit ar=%v snap=%+v err=%v", ar2, snap2, err)
+	}
+	// The superseded marker at minute 2 must not resurrect anything.
+	if _, _, err := in.Advance(2); !errors.Is(err, ErrClockRegression) {
+		t.Fatalf("old marker replay err=%v, want clock_regression", err)
+	}
+}
+
+// TestStorePrepareCommitBoundary asserts a prepared incident is not visible
+// until Commit, and that Len reflects exactly the committed set.
+func TestStorePrepareCommitBoundary(t *testing.T) {
+	store := NewStore()
+	in, err := store.Prepare(context.Background(), chainSpec())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if store.Len() != 0 {
+		t.Fatalf("prepared event visible before commit: len=%d", store.Len())
+	}
+	if _, ok := store.Get(in.ID()); ok {
+		t.Fatal("prepared event retrievable before commit")
+	}
+	store.Commit(in)
+	if store.Len() != 1 {
+		t.Fatalf("store len=%d after commit, want 1", store.Len())
+	}
+	if got, ok := store.Get(in.ID()); !ok || got != in {
+		t.Fatal("committed event not retrievable by id")
+	}
+}
+
+// TestStorePrepareCtxCancelledNoOrphan ensures a create whose context dies
+// during the build never yields a stored event, and the legacy Create path
+// still commits normally.
+func TestStorePrepareCtxCancelledNoOrphan(t *testing.T) {
+	store := NewStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.Prepare(ctx, largePipes()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepare err=%v, want context.Canceled", err)
+	}
+	if store.Len() != 0 {
+		t.Fatalf("cancelled prepare left %d orphan events", store.Len())
+	}
+	if _, err := store.Create(chainSpec()); err != nil {
+		t.Fatalf("legacy create: %v", err)
+	}
+	if store.Len() != 1 {
+		t.Fatalf("store len=%d, want 1", store.Len())
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 
 	"raincut/internal/incident"
@@ -79,24 +80,52 @@ func snapshotDTO(s incident.Snapshot) SnapshotDTO {
 	return out
 }
 
-// decodeStrict reads exactly one JSON object into dst, rejecting unknown
-// fields, trailing values and malformed bodies. Any failure is reported as a
-// stable 422 with code invalid_json.
-func decodeStrict(w http.ResponseWriter, r *http.Request, dst any) bool {
+// decodeJSON reads exactly one JSON value into dst, rejecting unknown
+// fields, trailing values and oversize bodies. It observes the request
+// context: decoding a multi-megabyte topology can itself take longer than
+// the client is willing to wait, so a request cancelled while the body is
+// still being parsed aborts the decode rather than reading and parsing the
+// whole body for nobody. On a non-cancellation failure it writes a stable
+// 422 invalid_json. The boolean reports whether the caller may proceed.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_json",
-			"body must be a single JSON object with integer fields: "+err.Error())
-		return false
+	type decodeResult struct {
+		err  error
+		more bool
 	}
-	if dec.More() {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_json",
-			"body must contain exactly one JSON value")
-		return false
+	result := make(chan decodeResult, 1)
+	go func() {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		err := dec.Decode(dst)
+		// Owned solely by this goroutine until it reports: dec.More() must
+		// not run on the caller's goroutine while the decoder state is still
+		// hot, so the trailing-value check happens here.
+		more := err == nil && dec.More()
+		result <- decodeResult{err: err, more: more}
+	}()
+	select {
+	case <-r.Context().Done():
+		return false // client gone; the decoder finishes with a closed body and is discarded
+	case res := <-result:
+		if res.err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_json",
+				"body must be a single JSON object with integer fields: "+res.err.Error())
+			return false
+		}
+		if res.more {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_json",
+				"body must contain exactly one JSON value")
+			return false
+		}
 	}
 	return true
+}
+
+// decodeStrict is the incident-route entry point kept for readability; it
+// is exactly the cancellation-aware strict decode used by every JSON route.
+func decodeStrict(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return decodeJSON(w, r, dst)
 }
 
 func (s *server) handleCreateIncident(w http.ResponseWriter, r *http.Request) {
@@ -113,8 +142,14 @@ func (s *server) handleCreateIncident(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	in, err := s.incidents.Create(spec)
+	// Validation and the shortest-path build run before the event exists;
+	// both observe the request context, so a cancelled create aborts without
+	// touching the store.
+	in, err := s.incidents.Prepare(r.Context(), spec)
 	if err != nil {
+		if clientGone(r, err) {
+			return
+		}
 		var ve *incident.ValidationError
 		if errors.As(err, &ve) {
 			writeError(w, http.StatusUnprocessableEntity, "invalid_input", ve.Msg)
@@ -123,7 +158,16 @@ func (s *server) handleCreateIncident(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create incident")
 		return
 	}
-	writeJSON(w, http.StatusOK, CreateIncidentResponse{ID: in.ID(), Snapshot: snapshotDTO(in.Snapshot())})
+	// Deliver the identifier first. Only once the response carrying the new
+	// id has been written does the event enter the store: a create whose
+	// response cannot be delivered leaves no orphan incident the caller could
+	// never name or reach.
+	resp := CreateIncidentResponse{ID: in.ID(), Snapshot: snapshotDTO(in.Snapshot())}
+	if err := writeJSON(w, http.StatusOK, resp); err != nil {
+		log.Printf("api: deliver create response for prepared incident %s: %v", in.ID(), err)
+		return
+	}
+	s.incidents.Commit(in)
 }
 
 func (s *server) handleAdvance(w http.ResponseWriter, r *http.Request) {
@@ -147,8 +191,16 @@ func (s *server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("minute must be >= 0, got %d", req.Minute))
 		return
 	}
+	// A request cancelled while queued behind another advance must not wait
+	// for or observe a commit: it returns silently and its lease is released.
+	if err := r.Context().Err(); err != nil {
+		return
+	}
 	newArrivals, snap, err := in.Advance(req.Minute)
 	if err != nil {
+		if clientGone(r, err) {
+			return
+		}
 		var ce *incident.ConflictError
 		detail := err.Error()
 		if errors.As(err, &ce) {
@@ -170,7 +222,24 @@ func (s *server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 	for _, a := range newArrivals {
 		dto = append(dto, ArrivalDTO{Node: int64(a.Node), AtMinute: a.AtMinute})
 	}
-	writeJSON(w, http.StatusOK, AdvanceResponse{NewArrivals: dto, Snapshot: snapshotDTO(snap)})
+	// The domain commit is permanent, but the response may never reach the
+	// caller. On a failed delivery of a non-empty increment remember the
+	// exact committed outcome so the next same-minute retry replays it
+	// instead of an empty list. A marker is only cleared once a response
+	// carrying those arrivals is delivered: an ordinary empty same-minute
+	// retry (possibly from a second concurrent client) must not erase a
+	// marker left by someone else's failed write.
+	writeErr := writeJSON(w, http.StatusOK, AdvanceResponse{NewArrivals: dto, Snapshot: snapshotDTO(snap)})
+	if writeErr != nil {
+		log.Printf("api: deliver advance response for incident %s minute %d: %v", id, req.Minute, writeErr)
+		if len(newArrivals) > 0 {
+			in.MarkUndelivered(req.Minute, newArrivals, snap)
+		}
+		return
+	}
+	if len(newArrivals) > 0 {
+		in.AcknowledgeAdvance(req.Minute)
+	}
 }
 
 // buildSpec converts the request into a domain spec; it reports a stable 422

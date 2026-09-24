@@ -9,9 +9,20 @@
 // optimal cut never severs them. The solver is Dinic's algorithm
 // implemented from scratch on 64-bit capacities; no external solver and
 // no cut-set enumeration is used.
+//
+// Every solve accepts a context: if the request that owns the computation
+// is cancelled (client gone, connection closed) while the build, a BFS
+// phase or a DFS augmentation is running, the solver stops at the next
+// checked node and returns context.Canceled/context.DeadlineExceeded
+// without producing a result. An abandoned solve therefore releases its
+// drain lease promptly instead of running a large graph to completion for
+// nobody.
 package flow
 
-import "math"
+import (
+	"context"
+	"math"
+)
 
 // Edge is a directed pipe with a shutdown cost.
 type Edge struct {
@@ -51,25 +62,52 @@ func (d *Dinic) AddEdge(u, v int, c int64) {
 
 // MaxFlow computes the maximum flow from s to t.
 func (d *Dinic) MaxFlow(s, t int) int64 {
+	flow, err := d.MaxFlowCtx(context.Background(), s, t)
+	if err != nil {
+		// The background context is never cancelled, so a context error
+		// here is unreachable.
+		return 0
+	}
+	return flow
+}
+
+// MaxFlowCtx computes the maximum flow from s to t, observing ctx. The
+// first cancellation observed before a phase, between augmentations or
+// inside the graph traversal aborts the whole solve and the partial flow
+// is discarded: callers must not treat a returned error as a valid flow
+// value.
+func (d *Dinic) MaxFlowCtx(ctx context.Context, s, t int) (int64, error) {
 	var flow int64
-	for d.bfs(s, t) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if !d.bfs(ctx, s, t) {
+			return flow, nil
+		}
 		for i := range d.next {
 			d.next[i] = 0
 		}
 		for {
-			pushed := d.dfs(s, t, math.MaxInt64)
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			pushed, err := d.dfs(ctx, s, t, math.MaxInt64)
+			if err != nil {
+				return 0, err
+			}
 			if pushed == 0 {
 				break
 			}
 			flow += pushed
 		}
 	}
-	return flow
 }
 
 // bfs builds the level graph and reports whether t is reachable from s in
-// the residual network.
-func (d *Dinic) bfs(s, t int) bool {
+// the residual network. It observes ctx so a cancelled request cannot stay
+// trapped in a long level scan.
+func (d *Dinic) bfs(ctx context.Context, s, t int) bool {
 	for i := range d.level {
 		d.level[i] = -1
 	}
@@ -77,6 +115,11 @@ func (d *Dinic) bfs(s, t int) bool {
 	queue := make([]int, 0, len(d.g))
 	queue = append(queue, s)
 	for head := 0; head < len(queue); head++ {
+		if head&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return false
+			}
+		}
 		u := queue[head]
 		for _, a := range d.g[u] {
 			if a.cap > 0 && d.level[a.to] < 0 {
@@ -88,10 +131,16 @@ func (d *Dinic) bfs(s, t int) bool {
 	return d.level[t] >= 0
 }
 
-// dfs pushes flow along admissible arcs of the level graph.
-func (d *Dinic) dfs(u, t int, f int64) int64 {
+// dfs pushes flow along admissible arcs of the level graph. Cancellation is
+// checked at every fresh frame, so an augmentation in progress finishes its
+// current short push while the next traversal unwinds immediately instead of
+// completing the whole blocking flow.
+func (d *Dinic) dfs(ctx context.Context, u, t int, f int64) (int64, error) {
 	if u == t {
-		return f
+		return f, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	for ; d.next[u] < len(d.g[u]); d.next[u]++ {
 		i := d.next[u]
@@ -99,14 +148,17 @@ func (d *Dinic) dfs(u, t int, f int64) int64 {
 		if a.cap <= 0 || d.level[a.to] != d.level[u]+1 {
 			continue
 		}
-		pushed := d.dfs(a.to, t, min(f, a.cap))
+		pushed, err := d.dfs(ctx, a.to, t, min(f, a.cap))
+		if err != nil {
+			return 0, err
+		}
 		if pushed > 0 {
 			a.cap -= pushed
 			d.g[a.to][a.rev].cap += pushed
-			return pushed
+			return pushed, nil
 		}
 	}
-	return 0
+	return 0, nil
 }
 
 // MinShutdownCost returns the minimum total cost of pipes whose removal
@@ -114,9 +166,23 @@ func (d *Dinic) dfs(u, t int, f int64) int64 {
 // exists. Self-loops never cross a cut and parallel edges are charged
 // individually, so both are handled naturally by the reduction.
 func MinShutdownCost(n int, edges []Edge, sources, sinks []int) int64 {
+	cost, err := MinShutdownCostCtx(context.Background(), n, edges, sources, sinks)
+	if err != nil {
+		return 0
+	}
+	return cost
+}
+
+// MinShutdownCostCtx is the cancellation-aware form of MinShutdownCost:
+// the graph build and every flow phase observe ctx, and a cancelled
+// request aborts before any value is returned.
+func MinShutdownCostCtx(ctx context.Context, n int, edges []Edge, sources, sinks []int) (int64, error) {
 	var total int64
 	for _, e := range edges {
 		total += e.Cost
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 	}
 	// Any cut severing a super arc costs at least total+1, while cutting
 	// every original edge out of the sources costs at most total, so an
@@ -124,8 +190,11 @@ func MinShutdownCost(n int, edges []Edge, sources, sinks []int) int64 {
 	big := total + 1
 	superSource, superSink := n, n+1
 	d := NewDinic(n + 2)
-	for _, e := range edges {
-		d.AddEdge(e.From, e.To, e.Cost)
+	for i := range edges {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		d.AddEdge(edges[i].From, edges[i].To, edges[i].Cost)
 	}
 	for _, s := range sources {
 		d.AddEdge(superSource, s, big)
@@ -133,5 +202,5 @@ func MinShutdownCost(n int, edges []Edge, sources, sinks []int) int64 {
 	for _, t := range sinks {
 		d.AddEdge(t, superSink, big)
 	}
-	return d.MaxFlow(superSource, superSink)
+	return d.MaxFlowCtx(ctx, superSource, superSink)
 }

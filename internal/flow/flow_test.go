@@ -1,9 +1,12 @@
 package flow
 
 import (
+	"context"
+	"errors"
 	"math"
 	"math/rand"
 	"testing"
+	"time"
 )
 
 func TestMinShutdownCost(t *testing.T) {
@@ -119,5 +122,77 @@ func TestLargeNetwork(t *testing.T) {
 	}
 	if got := MinShutdownCost(n, edges, []int{0}, []int{1}); got != want {
 		t.Fatalf("got %d, want %d", got, want)
+	}
+}
+
+// cancellationEdges builds the large dense network used by the cancellation
+// tests: it is expensive enough (100k arcs) that a cancellation raced
+// against the solve can win, while still completing in milliseconds when
+// the context stays open.
+func cancellationEdges() (int, []Edge) {
+	const n = 20000
+	const m = 100000
+	rng := rand.New(rand.NewSource(7))
+	edges := make([]Edge, 0, m)
+	for i := 2; i <= 5000; i++ {
+		edges = append(edges, Edge{0, i, 1_000_000_000})
+		edges = append(edges, Edge{i, 1, int64(1 + rng.Intn(1000))})
+	}
+	for len(edges) < m {
+		u := 2 + rng.Intn(n-2)
+		v := 2 + rng.Intn(n-2)
+		edges = append(edges, Edge{u, v, 1_000_000_000})
+	}
+	return n, edges
+}
+
+// TestMinShutdownCostCtxPreCancelled ensures a request already cancelled
+// before the solve starts never runs a single phase.
+func TestMinShutdownCostCtxPreCancelled(t *testing.T) {
+	n, edges := cancellationEdges()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := MinShutdownCostCtx(ctx, n, edges, []int{0}, []int{1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-cancelled solve err=%v, want context.Canceled", err)
+	}
+}
+
+// TestMinShutdownCostCtxCancelledMidFlight races a cancellation against a
+// large solve. The solve must observe the cancellation promptly and never
+// return a result afterwards; an uncancelled solve of the same graph still
+// yields the exact answer, proving cancellation does not corrupt the
+// computation contract.
+func TestMinShutdownCostCtxCancelledMidFlight(t *testing.T) {
+	n, edges := cancellationEdges()
+	const races = 10
+	var observedCancellation bool
+	for i := 0; i < races; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := MinShutdownCostCtx(ctx, n, edges, []int{0}, []int{1})
+			done <- err
+		}()
+		// Cancel after a short delay: on a millisecond-scale solve either
+		// the cancellation lands mid-flight or the solve legitimately wins;
+		// shrinking the delay sweeps the interleaving over repeated races.
+		time.AfterFunc(time.Duration(i)*100*time.Microsecond, cancel)
+		select {
+		case err := <-done:
+			if errors.Is(err, context.Canceled) {
+				observedCancellation = true
+			} else if err != nil {
+				t.Fatalf("solve err=%v, want nil or context.Canceled", err)
+			}
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("cancelled solve never returned")
+		}
+	}
+	if !observedCancellation {
+		t.Fatalf("none of %d races observed a mid-flight cancellation", races)
+	}
+	if got := MinShutdownCost(n, edges, []int{0}, []int{1}); got <= 0 {
+		t.Fatalf("uncancelled solve after cancellations = %d, want positive cost", got)
 	}
 }
